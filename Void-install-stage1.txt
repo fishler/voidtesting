@@ -1,0 +1,144 @@
+###Set Keyboard###
+loadkeys $(ls /usr/share/kbd/keymaps/i386/**/*.map.gz | grep us)
+
+###Set repos###
+truncate -s 0 00-repository-main.conf && echo "repository=https://mirror.aarnet.edu.au/pub/voidlinux/current" > /etc/xbps.d/00-repository-main.conf
+truncate -s 0 10-repository-nonfree.conf && echo "repository=https://mirror.aarnet.edu.au/pub/voidlinux/current/nonfree" > cd /etc/xbps.d/10-repository-nonfree.conf
+
+###Install packages need for stage 1###
+xbps-install -Su -y xbps gptfdisk parted
+
+###Set Variables### 
+MY_USERNAME=test
+PC_Name=Void
+RAM_GB=$(free -g | awk '/^Mem:/ {print $2}')
+BTRFS_OPTS="compress=zstd,noatime,space_cache=v2,discard=async,ssd"
+
+###Partition Disk###
+sgdisk -o /dev/sda -n 1::+512MiB -c 1:"EFI" -t 1:ef00 -n 2::+1024MiB -c 2:"Boot" -t 2:8300 -n 3::0 -c 3:"Root" -t 3:8300 /dev/sda
+
+###Make FileSystem###
+mkfs.vfat -F32 -n EFI /dev/sda1
+mkfs.ext4 -L Boot /dev/sda2
+mkfs.btrfs -f -L Root /dev/sda3
+
+###Create initial mounts###
+mount -o $BTRFS_OPTS /dev/sda3 /mnt
+btrfs subvolume create /mnt/@
+btrfs subvolume create /mnt/@home
+btrfs subvolume create /mnt/@snapshots
+umount -l /mnt
+
+mount -o $BTRFS_OPTS,subvol=@ /dev/sda3 /mnt
+mkdir -p /mnt/home
+mount -o $BTRFS_OPTS,subvol=@home /dev/sda3/mnt/home
+mkdir -p /mnt/.snapshots
+mount -o $BTRFS_OPTS,subvol=@snapshots /dev/sda3 /mnt/.snapshots
+
+mkdir -p /mnt/var/cache
+btrfs subvolume create /mnt/var/cache/xbps
+btrfs subvolume create /mnt/var/tmp
+btrfs subvolume create /mnt/srv
+
+btrfs subvolume create /mnt/var/swap
+
+mkdir /mnt/efi
+mount -o rw,noatime /dev/sda1 /mnt/efi
+
+mkdir /mnt/boot
+mount -o rw,noatime /dev/sda2 /mnt/boot
+
+###Add repo and install base packages###
+REPO=https://mirror.aarnet.edu.au/pub/voidlinux/current
+ARCH=x86_64
+
+XBPS_ARCH=$ARCH xbps-install -S -r /mnt -R "$REPO" base-system bash zsh cryptsetup sudo nano git btrfs-progs base-devel efibootmgr mtools dosfstools grub-btrfs grub-x86_64-efi elogind dbus void-repo-nonfree
+
+###bind system mounts###
+for dir in dev proc sys run; do mount --rbind /$dir /mnt/$dir; mount --make-rslave /mnt/$dir; done
+
+###Copy Resolv to new system for internet###
+cp /etc/resolv.conf /mnt/etc/
+
+###Chroot into install###
+BTRFS_OPTS=$BTRFS_OPTS PS1='(chroot) # ' chroot /mnt/ /bin/bash
+
+###Set Variables### 
+MY_USERNAME=marc
+PC_Name=Void
+RAM_GB=$(free -g | awk '/^Mem:/ {print $2}')
+BTRFS_OPTS="compress=zstd,noatime,space_cache=v2,discard=async,ssd"
+MY_USERNAME=test
+
+###Set Clock, Keymap, TimeZone, and locale###
+ln -sf /usr/share/zoneinfo/Australia/Australia /etc/localtime
+
+sed -i 's/#KEYMAP="es"/KEYMAP="us"/g' /etc/rc.conf && sed -i 's/#HARDWARECLOCK="UTC"/HARDWARECLOCK="localtime"/g' /etc/rc.conf
+
+LANG=en_AU.UTF-8 >> /etc/default/locale
+
+#nano /etc/default/libc-locales
+> /etc/default/libc-locales && echo -e "en_AU.UTF-8 UTF-8 \nen_US.UTF-8 UTF-8" >> /etc/default/libc-locales && xbps-reconfigure -f glibc-locales
+
+hwclock --systohc
+
+###Set PC Name###
+echo kitty > /etc/hostname
+sed -i "/# End of file/i 127.0.1.1\t$PC_Name.ipalot.home \t$PC_Name" /etc/hosts
+
+###Set up fstab###
+UEFI_UUID=$(blkid -s UUID -o value /dev/sda1)
+GRUB_UUID=$(blkid -s UUID -o value /dev/sda2)
+ROOT_UUID=$(blkid -s UUID -o value /dev/sda3)
+
+cat <<EOF > /etc/fstab
+UUID=$ROOT_UUID / btrfs $BTRFS_OPTS,subvol=@ 0 1
+UUID=$UEFI_UUID /efi vfat defaults,noatime 0 2
+UUID=$GRUB_UUID /boot ext4 defaults,noatime 0 2
+UUID=$ROOT_UUID /home btrfs $BTRFS_OPTS,subvol=@home 0 2
+UUID=$ROOT_UUID /.snapshots btrfs $BTRFS_OPTS,subvol=@snapshots 0 2
+tmpfs /tmp tmpfs defaults,nosuid,nodev 0 0
+EOF
+
+###Host Only Install###
+echo hostonly=yes >> /etc/dracut.conf
+
+### Install Ucode and Grub packages###
+xbps-install -Su intel-ucode grub-x86_64-efi #For AMD linux-firmware-amd
+
+###Install and setup Grub###
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id="Void Linux"
+grub-mkconfig -o /boot/grub/grub.cfg
+
+###Create SwapFile for BTRFS###
+btrfs subvolume create  /var/swap
+btrfs filesystem mkswapfile --size $RAM_GB\g --uuid clear var/swap/swapfile
+truncate -s 0 /var/swap/swapfile
+chattr +C /var/swap/swapfile
+btrfs property set /var/swap compression none
+dd if=/dev/zero of=/var/swap/swapfile bs=1G count=16 status=progress
+mkswap /var/swap/swapfile
+swapon /var/swap/swapfile
+
+###resume_offset To tell Grub about SwapFile
+RESUME_OFFSET=$(btrfs inspect-internal map-swapfile -r /var/swap/swapfile)
+
+echo GRUB_CMDLINE_LINUX="resume=UUID=$ROOT_UUID resume_offset=$RESUME_OFFSET" >> /etc/default/grub
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id="Void Linux"
+grub-mkconfig -o /boot/grub/grub.cfg
+
+###Set Root Password, Setup User and password###
+passwd
+useradd -m -G wheel,input,video -s /bin/zsh $MY_USERNAME
+passwd $MY_USERNAME
+
+###Allow user to use SUDO###
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers   
+
+###Reconfigure All Packages###
+xbps-reconfigure -fa
+
+###Finished Staged 1###
+exit
+umount -R -l /mnt
+reboot
